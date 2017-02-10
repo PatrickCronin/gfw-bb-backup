@@ -1,20 +1,32 @@
-package GFW::BBB::RemoteBackupSet;
+package GFW::BBB::DataSet;
 
 use Moose;
 
-use Data::Compare ();
+use Data::Compare;
 use Lingua::EN::Inflect qw(NO);
+use MooseX::Types::Path::Tiny qw(Path Paths);
 
-has remote_host => (
+has host => (
 	is => 'ro',
-	isa => 'GFW::BBB::RemoteHost',
+	does => 'GFW::BBB::Role::Host',
 	required => 1,
 );
 
-with qw(
-	GFW::BBB::Role::BackupSet
-	GFW::BBB::Role::HasConfig
+has dataset_root => (
+    is => 'ro',
+    isa => Path,
+    required => 1,
 );
+
+has members => (
+    is => 'ro',
+    isa => Paths,
+    required => 1,
+);
+
+sub member_file_extensions {
+    return qw(4dd 4DIndx Match);
+}
 
 sub new_from_consistent_copy {
 	my ($self, $target_dir) = @_;
@@ -24,38 +36,39 @@ sub new_from_consistent_copy {
 		$_ => $target_dir->child($_->basename)
 	} $self->_full_path_members;
 
-	my $max_attempts = $self->_config->{'Production Database Settings'}
-		->{max_backup_attempts};
+	my $max_attempts = $self->_config->get_value(qw(
+		create-new-production-backup
+		max-backup-attempts
+	));
 	my $current_attempt = 0;
-
 	while ($current_attempt < $max_attempts) {
 		my %source_md5s = $self->_trim_keys_to_basename(
-			$self->remote_host->md5( keys %members_map )
+			$self->host->md5( keys %members_map )
 		);
 
-		$self->remote_host->copy( $_, $members_map{$_} )
+		$self->host->copy( $_, $members_map{$_} )
 			for keys %members_map;
 
 		my %target_md5s = $self->_trim_keys_to_basename(
-			$self->remote_host->md5( values %members_map )
+			$self->host->md5( values %members_map )
 		);
 
-		return GFW::BBB::RemoteBackupSet->new(
-	        remote_host => $self->remote_host,
-	        backup_set_root => $target_dir,
+		return GFW::BBB::DataSet->new(
+	        host => $self->host,
+	        dataset_root => $target_dir,
 	        members => $self->members
 	    ) if $self->_md5s_are_consistent(\%source_md5s, \%target_md5s);
 
 		$current_attempt++;
 	};
 
-	die "Failed to create a consistent copy within $max_attempt attempts.";
+	die "Failed to create a consistent copy within $max_attempts attempts.";
 }
 
 sub _full_path_members {
 	my $self = shift;
 
-	return map { $self->backup_set_root->child($_) } @{ $self->members };
+	return map { $self->dataset_root->child($_) } @{ $self->members };
 }
 
 sub _trim_keys_to_basename {

@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
-use ModernPerl;
+use Modern::Perl;
 
 use GFW::BBB::ProductionBackupCreator;
 
-GFW::BBB::ProductionBackupCreator->new_from_options->run;
+GFW::BBB::ProductionBackupCreator->new_with_options->run;

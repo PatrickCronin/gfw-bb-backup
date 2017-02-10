@@ -1,15 +1,15 @@
-package GFW::BBB::RemoteHost;
+package GFW::BBB::Host::Remote;
 
 use Moose;
 
-use GFW::BBB::Types qw( HashRef Maybe Path ):
 use IPC::PerlSSH;
 use Net::OpenSSH;
+use Try::Tiny qw(catch try);
 
 has ssh_host_config => (
     is => 'ro',
-    isa => HashRef,
-    predicate => 'has_ssh_host_config';
+    isa => 'HashRef',
+    predicate => 'has_ssh_host_config',
 );
 
 has _ipc_perlssh => (
@@ -21,7 +21,7 @@ has _ipc_perlssh => (
 
 has _ipc_perlssh_config => (
     is => 'ro',
-    isa => HashRef,
+    isa => 'HashRef',
     lazy => 1,
     builder => '_build_ipc_perlssh_config',
 );
@@ -33,8 +33,14 @@ has _net_openssh => (
     builder => '_build_net_openssh',
 );
 
-with 'GFW::BBB::Role::Location::ChildrenAt';
-with 'GFW::BBB::Role::Location::TempDir';
+has _required_modules => (
+    is => 'ro',
+    isa => 'HashRef',
+    required => 1,
+    builder => '_build_required_modules',
+);
+
+with 'GFW::BBB::Role::Host';
 
 sub _build_ipc_perlssh {
     my $self = shift;
@@ -42,7 +48,7 @@ sub _build_ipc_perlssh {
     die q{Can't create a IPC::PerlSSH object because there's no ssh_host_config!}
         if ! $self->has_ssh_host_config;
 
-    return IPC::PerlSSH->new(%{ $self->ipc_perlssh_config });
+    return IPC::PerlSSH->new(%{ $self->_ipc_perlssh_config });
 }
 
 sub _build_ipc_perlssh_config {
@@ -52,6 +58,17 @@ sub _build_ipc_perlssh_config {
         $self->ssh_host_config,
         $self->_ipc_perlssh_from_net_openssh_config_map
     );
+}
+
+sub _build_required_modules {
+    my $self = shift;
+
+    return {
+        copy => 'File::Copy',
+        find => 'Path::Iterator::Rule',
+        md5  => 'Crypt::Digest::MD5',
+        path => 'Path::Tiny',
+    };
 }
 
 sub _translate_config { 
@@ -77,15 +94,16 @@ sub _translate_config {
 }
 
 sub _ipc_perlssh_from_net_openssh_config_map {
-    return (
+    return {
         Host => 'host',
         Port => 'port',
         User => 'user',
         SshPath => 'ssh_cmd',
         SshOptions => {
             '-i' => 'key_path',
-        }
-    );
+        },
+        Perl => 'perl'
+    };
 }
 
 sub _build_net_openssh {
@@ -103,30 +121,31 @@ sub _build_net_openssh {
 sub _run_remote_perl {
     my ($self, @command) = @_;
 
-    return $self->_ips->eval(@command);
+    return $self->_ipc_perlssh->eval(@command);
 }
 
 sub _run_remote_command {
     my ($self, $cmd) = @_;
 
     my $stdout = $self->_net_openssh->capture(@{ $cmd });
-    die "Error while running $cmd: " . $ssh->error if $ssh->error;
+    die "Error while running $cmd: " . $self->_net_openssh->error
+        if $self->_net_openssh->error;
 
     return $stdout;
 }
 
-sub files_with_extensions_in {
+sub files_with_extensions {
     my ($self, $path, @extensions) = @_;
 
-    my ($path, $search_regex) = @_;
-
-    my @children = $self->_run_remote_perl(<<'FILES', $path->stringify, @extensions);
-use Path::Iterator::Rule;
+    my $script = 'use ' . $self->_required_modules->{find} . ';' . <<'SCRIPT';
 my $path = shift;
 my $rule = Path::Iterator::Rule->new->file;
 $rule->or( map { $rule->new->name("*.$_") } @_ );
 return $rule->all($path);
-FILES
+SCRIPT
+
+    my @children = $self->_run_remote_perl(
+        $script, $path->stringify, @extensions);
 
     return map { $path->child($_) } @children;
 }
@@ -134,11 +153,12 @@ FILES
 sub md5 {
     my ($self, @paths) = @_;
 
-    my %md5s;
-    $md5s{$_->stringify} = $self->_run_remote_perl(<<'MD5', $_->stringify)
-use Crypt::Digest::MD5;
+    my $script = 'use ' . $self->_required_modules->{md5} . ';' . <<'SCRIPT';
 return md5_file_hex($_[0]);
-MD5
+SCRIPT
+
+    my %md5s;
+    $md5s{$_->stringify} = $self->_run_remote_perl($script, $_->stringify)
         for @paths;
 
     return %md5s;
@@ -147,29 +167,51 @@ MD5
 sub tempdir {
     my $self = shift;
 
-    return $self->_run_remote_perl(<<'TEMPDIR');
-use Path::Tiny;
+    my $script = 'use ' . $self->_required_modules->{path} . ';' . <<'SCRIPT';
 return Path::Tiny->tempdir(CLEANUP => 0)->stringify;
-TEMPDIR
+SCRIPT
+
+    return $self->_run_remote_perl($script);
 }
 
 sub copy {
     my ($self, $source, $target) = @_;
 
-    return $self->_run_remote_perl(
-        <<'COPY', $source->stringify, $target->stringify);
-use File::Copy qw(copy);
+    my $script = 'use ' . $self->_required_modules->{copy} . ' qw(copy);'
+        . <<'SCRIPT';
 copy($_[0], $_[1]) or die "Copy failed: $!";
-COPY
+SCRIPT
+
+    return $self->_run_remote_perl(
+        $script, $source->stringify, $target->stringify);
+}
+
+sub rsync_put {
+    my ($self, $target_path, @source_paths) = @_;
+
+    return $self->_net_openssh->rsync_put(@source_paths, $target_path);
 }
 
 sub rsync_get {
-    my ($self, $local_dir, @remote_paths) = @_;
+    my ($self, $target_path, @source_paths) = @_;
 
-    return $self->_net_openssh->rsync_get(
-        (map { $_->stringify } @remote_paths),
-        $local_dir->stringify
-    );
+    return $self->_net_openssh->rsync_get(@source_paths, $target_path);
+}
+
+sub test_required_modules {
+    my $self = shift;
+
+    my $errors;
+    foreach my $module (values %{ $self->_required_modules }) {
+        try {
+            $self->_run_remote_perl('use ' . $module . ';');
+            print "The remote host has $module.\n";
+        }
+        catch {
+            print "The remote host does not have $module.\n";
+            $errors++;
+        };
+    }
 }
 
 __PACKAGE__->meta->make_immutable;
