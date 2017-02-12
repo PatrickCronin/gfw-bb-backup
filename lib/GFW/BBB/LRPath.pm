@@ -1,4 +1,4 @@
-package GFW::BBB::Path;
+package GFW::BBB::LRPath;
 
 use Moose;
 
@@ -15,6 +15,12 @@ has path => (
     isa => Path,
     required => 1,
 );
+
+sub delete {
+    my $self = shift;
+
+    $self->host->delete($self->path);
+}
 
 __PACKAGE__->meta->make_immutable;
 

@@ -3,9 +3,11 @@ package GFW::Config;
 use MooseX::Singleton;
 
 use Config::INI::Reader;
+use Hash::Merge qw(merge);
 use List::Gather qw(gather take);
-use List::Util qw(any);
+use List::Util qw(first);
 use Path::Tiny qw(path);
+use Try::Tiny qw(catch try);
 
 has _parsed_config => (
     is => 'ro',
@@ -19,13 +21,14 @@ sub _build_parsed_config {
 
     my @possible_config_paths = $self->_possible_config_paths;
 
-    my ($selected_config) = grep { $_->exists } @possible_config_paths;
-
-    return Config::INI::Reader->read_file( $selected_config )
-        if $selected_config;
-
-    die "Could not find an existing file. Search at:\n\t-"
+    my ($selected_config) = first { $_->exists } @possible_config_paths
+        or die "Could not find an existing file. Search at:\n\t-"
         . (join "\n\t-", @possible_config_paths);
+
+    my $config = Config::INI::Reader->read_file( $selected_config );
+
+    return merge($self->_default_config_values, $config);
+        
 }
 
 sub _possible_config_paths {
@@ -35,6 +38,15 @@ sub _possible_config_paths {
     );
 
     return map { path($_) } @paths;
+}
+
+sub _default_config_values {
+    return {
+        host_defaults => {
+            'path-to-tar' => 'tar',
+            'path-to-ssh' => 'ssh',
+        }
+    };
 }
 
 sub get_value {
@@ -53,7 +65,7 @@ sub get_host_paths {
     return gather {
         foreach my $host_path (@host_paths) {
             my ($host, $path) = split /\s*:\s*/, $host_path;
-            take { host => $host, path => $path };
+            take { host => $host, path => path($path) };
         }
     };
 }
@@ -64,26 +76,28 @@ sub _search {
     return if ! @key_path;
 
     my $key = shift @key_path;
-    die "Could not find key $key" if ! exists $tree->{$key};
+    return undef if ! exists $tree->{$key};
     return $tree->{$key} if ! @key_path;
     return $self->_search($tree->{$key}, @key_path);
 }
 
-
-sub load_ssh_host_config {
+sub load_host_config {
     my ($self, $host_config_name) = @_;
 
-    my %config;
+    my %config = %{
+        merge(
+            $self->get_value('host_defaults'),
+            $self->get_value($host_config_name)
+        )
+    };
 
-    my $ssh_cmd = $self->get_value(qw( general ssh-cmd ));
-    $config{ssh_cmd} = $ssh_cmd if $ssh_cmd;
+    # Rename values for Net::OpenSSH
+    $config{ssh_cmd} = delete $config{'path-to-ssh'}
+        if exists $config{'path-to-ssh'};
 
-    my $host_config = $self->get_value($host_config_name);
-
-    for my $configured_key (keys %{ $host_config }) {
-        $config{$configured_key =~ s/-/_/r}
-            = $host_config->{$configured_key}
-    }
+    # Change - to _ in keys
+    $config{$_ =~ s/-/_/gr} = delete $config{$_}
+        for grep { /-/ } keys %config;
 
     return \%config;
 }

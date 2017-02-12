@@ -3,10 +3,11 @@ package GFW::BBB::ProductionBackupCreator;
 use Moose;
 
 use GFW::BBB::Host::Factory;
-use GFW::BBB::DataSet;
+use GFW::BBB::LRDataSet;
 use MooseX::Types::Path::Tiny qw(Path);
 use Lingua::EN::Inflect qw(NO);
 use Path::Tiny qw(path);
+use Try::Tiny qw(catch try);
 
 has _production_host_path => (
     is => 'ro',
@@ -22,18 +23,27 @@ has _production_host => (
     builder => '_build_production_host',
 );
 
-has _production_dataset_members => (
-    is => 'ro',
-    isa => 'ArrayRef',
-    lazy => 1,
-    builder => '_build_production_dataset_members'
-);
-
 has _production_dataset => (
     is => 'ro',
-    isa => 'GFW::BBB::DataSet',
+    isa => 'GFW::BBB::LRDataSet',
     lazy => 1,
-    builder => '_build_production_dataset'
+    builder => '_build_production_dataset',
+);
+
+has _consistent_dataset_copy => (
+    is => 'ro',
+    isa => 'GFW::BBB::LRDataSet',
+    lazy => 1,
+    builder => '_build_consistent_dataset_copy',
+    predicate => '_has_consistent_dataset_copy',
+);
+
+has _compressed_dataset_copy => (
+    is => 'ro',
+    isa => 'GFW::BBB::LRPath',
+    lazy => 1,
+    builder => '_build_compressed_dataset_copy',
+    predicate => '_has_compressed_dataset_copy',
 );
 
 has test_required_modules => (
@@ -48,39 +58,80 @@ with qw(
     MooseX::Getopt::Dashes
 );
 
+sub DEMOLISH {
+    my $self = shift;
+
+    $self->_consistent_dataset_copy->delete
+        if $self->_has_consistent_dataset_copy;
+
+    $self->_compressed_dataset_copy->delete
+        if $self->_has_compressed_dataset_copy;
+};
+
 sub _build_production_host_path {
     my $self = shift;
 
-    my ($production_host_path) = $self->_config->get_host_paths(qw(
-        create-new-production-backup
-        production-backup
-    ));
-
-    return $production_host_path;
+    return (
+        $self->_config->get_host_paths(qw(
+            create-new-production-backup
+            production-backup
+        ))
+    )[0];
 }
 
 sub _build_production_host {
     my $self = shift;
 
-    return GFW::BBB::Host::Factory->new->new_host_from_config(
-        $self->_production_host_path->{host}
+    return GFW::BBB::Host::Factory->new_from_config(
+        $self->_production_host_path->{host},
+        $self->_config->load_host_config(
+            $self->_production_host_path->{host}
+        )
     );
 }
 
-sub _build_production_dataset_members {
+sub _build_production_dataset {
+    my $self = shift;
+
+    return GFW::BBB::LRDataSet->new(
+        host => $self->_production_host,
+        dataset_root => $self->_production_host_path->{path},
+        members => $self->_find_production_dataset_members,
+    );
+}
+
+sub _build_consistent_dataset_copy {
+    my $self = shift;
+
+    return $self->_production_dataset->new_from_consistent_copy_at(
+        $self->_production_host->tempdir
+    );
+}
+
+sub _build_compressed_dataset_copy {
+    my $self = shift;
+
+    return $self->_consistent_dataset_copy->compress_to(
+        $self->_production_host->tempfile
+    );
+}
+
+sub _find_production_dataset_members {
     my $self = shift;
     
-    my @required_extensions = GFW::BBB::DataSet->member_file_extensions;
+    my @required_extensions = GFW::BBB::LRDataSet->member_file_extensions;
 
-    my @members = $self->_production_host->files_with_extensions(
-        path($self->_production_host_path->{path}),
+    my @found = $self->_production_host->files_with_extensions(
+        $self->_production_host_path->{path},
         @required_extensions
     );
 
-    my %basename;
     my $alternation_string = join q{|}, @required_extensions;
     my $search_regex = qr/ \. (?:$alternation_string) \z/x;
-    $basename{ $_->stringify =~ s{$search_regex}{}r }++ for @members;
+
+    my %basename;
+    $basename{ $_->basename =~ s{$search_regex}{}r }++ for @found;
+
     my @viable_basenames = grep {
         $basename{$_} == @required_extensions
     } keys %basename;
@@ -90,37 +141,27 @@ sub _build_production_dataset_members {
         . $self->_production_host_path->{path}
         if @viable_basenames != 1;
 
-    return [ map { path($viable_basenames[0] . q{.} . $_) } @required_extensions ];
-}
-
-sub _build_production_dataset {
-    my $self = shift;
-
-    return GFW::BBB::DataSet->new(
-        host => $self->_production_host,
-        dataset_root => path($self->_production_host_path->{path}),
-        members => $self->_production_dataset_members,
-    );
+    return [
+        map { 
+            $self->_production_host_path->{path}
+                ->child($viable_basenames[0] . q{.} . $_)
+        } @required_extensions
+    ];
 }
 
 sub run {
     my $self = shift;
 
-    my $consistent_copy = $self->_production_dataset
-        ->new_from_consistent_copy($self->_production_dataset);
-
-    my $compressed_copy = $consistent_copy->compress;
-
-    my @archive_host_paths = $self->_config->get_host_paths(qw(
-        create-new-production-backup
-        archives
-    ));
-
-    $self->_production_host->safe_transfer(
-        $_->{host},
-        $_->{path},
-        $compressed_copy->path,
-    ) for @archive_host_paths;
+    try {
+        $self->_compressed_dataset_copy->transfer_to($_)
+            for $self->_config->get_host_paths(qw(
+                create-new-production-backup
+                archives
+            ));
+    }
+    catch {
+        warn $_;
+    };
 }
 
 __PACKAGE__->meta->make_immutable;
