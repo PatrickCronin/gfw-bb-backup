@@ -196,7 +196,8 @@ SCRIPT
 sub delete {
     my ($self, @paths) = @_;
 
-    my $script = <<'SCRIPT';
+    my $script = 'use ' . $self->_required_modules->{path} . ' qw(path);'
+        . <<'SCRIPT';
         my @paths = @_;
         path($_)->remove for @paths;
 SCRIPT

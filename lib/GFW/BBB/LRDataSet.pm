@@ -2,6 +2,7 @@ package GFW::BBB::LRDataSet;
 
 use Moose;
 
+use GFW::BBB::LRPath ();
 use Lingua::EN::Inflect qw(NO);
 use MooseX::Types::Path::Tiny qw(Path Paths);
 
